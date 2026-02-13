@@ -42,7 +42,6 @@ KNOWN_LABELS = [
 LABEL_PATTERN = re.compile(r"^\s*({})\s*$".format("|".join(map(re.escape, KNOWN_LABELS))))
 
 GENRE_HINTS = [
-    "전체",
     "연극",
     "뮤지컬",
     "서양음악(클래식)",
@@ -52,6 +51,7 @@ GENRE_HINTS = [
     "대중무용",
     "서커스/마술",
     "복합",
+    "전체",
 ]
 
 
