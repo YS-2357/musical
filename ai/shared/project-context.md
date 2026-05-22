@@ -1,7 +1,10 @@
 # Project Context
 
 - Project: musical
-- Goal: collect and normalize KOPIS performance data
-- Main scripts: `kopis_iterate_pf_playwright.py`, `kopis_to_csv_playwright.py`, `recheck_genre_hint.py`
-- Main outputs: `kopis_iterated.csv`, `mt20ids_iterated.txt`, checkpoint files
-- Data collection jobs should remain resumable and traceable
+- Goal: collect KOPIS musical-category performance data
+- Approach: two-stage pipeline
+  1. List enumeration via KOPIS internal JSON API (`enumerate_musicals.py`)
+  2. Detail page rendering and parsing via Playwright (`kopis_iterate_pf_playwright.py --ids-file`)
+- Main inputs: `mt20ids_musical.txt`
+- Main outputs (gitignored): `kopis_musical.csv`, `mt20ids_musical_done.txt`, checkpoint, `skipped_musical.jsonl`
+- Data collection jobs are resumable; v1 brute-force iterator is archived in `legacy/v1-scraper`.

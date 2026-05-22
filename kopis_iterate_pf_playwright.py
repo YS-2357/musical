@@ -314,22 +314,22 @@ def load_existing_ids(path: str) -> Set[str]:
     return existing
 
 
-def load_checkpoint(path: str) -> Optional[int]:
-    # 마지막으로 시도한 숫자를 읽어 이어받기 시작점을 결정한다.
+def load_checkpoint(path: str) -> Optional[str]:
+    # 마지막으로 처리한 토큰(range: 정수 문자열, ids-file: mt20Id 문자열)을 반환.
     if not os.path.exists(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             v = f.read().strip()
-        return int(v) if v else None
+        return v or None
     except Exception:
         return None
 
 
-def save_checkpoint(path: str, n: int) -> None:
-    # 현재까지 진행한 숫자를 기록해 중단 시 이어받기 가능하게 한다.
+def save_checkpoint(path: str, token) -> None:
+    # 현재까지 진행한 토큰을 기록 (정수든 mt20Id 든 문자열로 직렬화).
     with open(path, "w", encoding="utf-8") as f:
-        f.write(str(n))
+        f.write(str(token))
 
 
 def _probe_one(page, n: int) -> bool:
@@ -410,6 +410,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default="kopis_ceiling.txt",
         help="auto-ceiling 결과 저장 경로",
     )
+    parser.add_argument(
+        "--ids-file",
+        default=None,
+        help="mt20Id 목록 파일 경로(한 줄에 하나). 지정 시 range/auto-ceiling 비활성.",
+    )
+    parser.add_argument(
+        "--expect-genre",
+        default=None,
+        help="ids-file 모드에서 기대 장르(기본: ids-file 사용 시 '뮤지컬'). 불일치 시 skipped-log에 genre_mismatch로 기록.",
+    )
     parser.add_argument("--delay", type=float, default=0.3, help="요청 간 지연(초, 기본 0.3)")
     parser.add_argument("--out-csv", default="kopis_iterated_v2.csv", help="출력 CSV")
     parser.add_argument("--out-ids", default="mt20ids_iterated_v2.txt", help="유효 mt20Id 출력")
@@ -453,20 +463,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    # 2) 입력 범위를 검증한다.
-    if not args.auto_ceiling and args.end is None:
-        parser.error("--end 또는 --auto-ceiling 중 하나는 필수입니다.")
-    if args.end is not None and args.end < args.start:
-        parser.error("--end는 --start 이상이어야 합니다.")
+    # 2) 입력 모드 검증.
+    ids_mode = bool(args.ids_file)
+    if ids_mode:
+        if args.auto_ceiling or args.end is not None:
+            parser.error("--ids-file 사용 시 --end / --auto-ceiling 와 함께 쓸 수 없습니다.")
+        if not os.path.exists(args.ids_file):
+            parser.error(f"--ids-file 경로가 존재하지 않습니다: {args.ids_file}")
+        if args.expect_genre is None:
+            args.expect_genre = "뮤지컬"  # 기본 기대 장르
+    else:
+        if not args.auto_ceiling and args.end is None:
+            parser.error("--end / --auto-ceiling / --ids-file 중 하나는 필수입니다.")
+        if args.end is not None and args.end < args.start:
+            parser.error("--end는 --start 이상이어야 합니다.")
 
     # 3) resume 옵션이면 시작 지점과 기존 성공 ID를 복원한다.
     start_n = args.start
+    resume_ck: Optional[str] = None
     seen_ids: Set[str] = set()
     if args.resume:
-        ck = load_checkpoint(args.checkpoint)
-        if ck is not None:
-            start_n = max(start_n, ck + 1)
-            print(f"[RESUME] checkpoint={ck} -> start={start_n}")
+        resume_ck = load_checkpoint(args.checkpoint)
+        if resume_ck is not None and not ids_mode:
+            try:
+                start_n = max(start_n, int(resume_ck) + 1)
+                print(f"[RESUME] checkpoint={resume_ck} -> start={start_n}")
+            except ValueError:
+                print(f"[WARN] checkpoint {resume_ck!r} not numeric — ignoring")
+                resume_ck = None
+        elif resume_ck is not None:
+            print(f"[RESUME] checkpoint={resume_ck} (ids-file mode)")
         if not args.ignore_seen:
             seen_ids = load_existing_ids(args.out_ids)
             if seen_ids:
@@ -484,23 +510,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         context = browser.new_context(locale="ko-KR")
         page = context.new_page()
 
-        # 5-1) --auto-ceiling 이면 본 루프 전에 ceiling 을 탐지한다.
-        if args.auto_ceiling:
+        # 5-1) --auto-ceiling 이면 본 루프 전에 ceiling 을 탐지한다. (ids-file 모드는 skip)
+        if args.auto_ceiling and not ids_mode:
             ceiling = probe_ceiling(page, args.probe_start)
             with open(args.ceiling_file, "w", encoding="utf-8") as f:
                 f.write(str(ceiling))
             print(f"[CEILING] PF{ceiling:06d} saved to {args.ceiling_file}")
             args.end = ceiling
 
-        # 6) PF 숫자 범위를 순회하며 상세 페이지를 파싱한다.
+        # 5-2) 입력 시퀀스를 준비한다. (range 모드 또는 ids-file 모드)
+        def input_seq():
+            if ids_mode:
+                with open(args.ids_file, "r", encoding="utf-8") as f:
+                    raw = [ln.strip() for ln in f if ln.strip()]
+                # 비-PF 라인 제외 + 순서 유지 dedup
+                seen_local: Set[str] = set()
+                ids: List[str] = []
+                for mt in raw:
+                    if re.fullmatch(r"PF\d+", mt) and mt not in seen_local:
+                        seen_local.add(mt)
+                        ids.append(mt)
+                # resume: checkpoint 이후만 처리
+                if args.resume and resume_ck and resume_ck in seen_local:
+                    idx = ids.index(resume_ck) + 1
+                    print(f"[RESUME] ids-file: skip first {idx} ids up to checkpoint {resume_ck}")
+                    ids = ids[idx:]
+                print(f"[INPUT] ids-file mode: {len(ids)} ids to process")
+                for mt in ids:
+                    # cp_token = mt20Id 그대로
+                    yield mt, mt
+            else:
+                print(f"[INPUT] range mode: PF{start_n:06d} .. PF{args.end:06d}")
+                for n in range(start_n, args.end + 1):
+                    yield f"PF{n:06d}", str(n)
+
+        # 6) 입력 시퀀스를 순회하며 상세 페이지를 파싱한다.
         attempts = 0
         ok_new = 0
         skip_count = 0
         err_count = 0
-        for n in range(start_n, args.end + 1):
+        last_cp_token: Optional[str] = None
+        for mt20id, cp_token in input_seq():
             attempts += 1
-            # 6-1) 현재 숫자를 mt20Id(PFxxxxxx) 형태로 만든다.
-            mt20id = f"PF{n:06d}"
+            last_cp_token = cp_token
             url = build_detail_url(mt20id)
             try:
                 # 6-2) 상세 페이지를 로드하고 파싱 가능한 형태로 만든다.
@@ -542,6 +594,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             url,
                             http_title=title or "",
                         )
+                    # 기대 장르 불일치 시 기록(ids-file 모드에서만).
+                    if args.expect_genre and genre_norm != args.expect_genre:
+                        log_skip(
+                            args.skipped_log,
+                            "genre_mismatch",
+                            mt20id,
+                            url,
+                            snippet=f"expected={args.expect_genre} got={genre_norm}",
+                            http_title=title or "",
+                        )
                 else:
                     # 유효하지 않으면 SKIP으로 기록한다.
                     skip_count += 1
@@ -574,7 +636,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # 7) 진행 상황을 주기적으로 출력한다.
             if args.log_every > 0 and attempts % args.log_every == 0:
                 print(
-                    f"[PROGRESS] at={n} attempts={attempts} ok_new={ok_new} "
+                    f"[PROGRESS] at={cp_token} attempts={attempts} ok_new={ok_new} "
                     f"skip={skip_count} err={err_count} total_seen={len(seen_ids)}"
                 )
 
@@ -582,9 +644,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.save_every > 0 and attempts % args.save_every == 0:
                 append_csv(args.out_csv, batch_rows)
                 append_ids(args.out_ids, batch_ids)
-                save_checkpoint(args.checkpoint, n)
+                save_checkpoint(args.checkpoint, cp_token)
                 print(
-                    f"[SAVE] at={n} batch_ids={len(batch_ids)} total_seen={len(seen_ids)}",
+                    f"[SAVE] at={cp_token} batch_ids={len(batch_ids)} total_seen={len(seen_ids)}",
                     file=sys.stderr,
                 )
                 batch_rows.clear()
@@ -596,7 +658,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 9) 루프 종료 후 남은 배치를 저장하고 체크포인트를 갱신한다.
     append_csv(args.out_csv, batch_rows)
     append_ids(args.out_ids, batch_ids)
-    save_checkpoint(args.checkpoint, args.end)
+    if last_cp_token is not None:
+        save_checkpoint(args.checkpoint, last_cp_token)
 
     # 10) 최종 요약을 출력하고 종료한다.
     print(
