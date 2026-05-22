@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from itertools import islice
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+
+# Playwright 의존성은 파싱 함수만 쓸 때 불필요하므로 지연 import 한다.
+# get_rendered_html / _probe_one / probe_ceiling / main 에서 필요 시 import.
 
 BASE_DETAIL_URL = "https://kopis.or.kr/por/db/pblprfr/pblprfrView.do"
 
@@ -57,7 +60,7 @@ GENRE_LABELS = [
     "분야",
     "분류",
 ]
-FIELDNAMES = ["mt20Id", "url", "title", "genre_hint", *KNOWN_LABELS]
+FIELDNAMES = ["mt20Id", "url", "title", "genre_hint", "genre_norm", "is_musical", *KNOWN_LABELS]
 
 
 def clean_text(s: str) -> str:
@@ -84,16 +87,9 @@ def normalize_value(value: str) -> str:
 
 def parse_label_value_blocks(soup: BeautifulSoup) -> Dict[str, str]:
     # 상세 페이지의 라벨-값 구조를 최대한 폭넓게 수집한다.
+    # 실측 결과 KOPIS 페이지는 <table>을 쓰지 않으므로 <dl>/<dt><dd>와
+    # 텍스트 라인 스캔 폴백만 유지한다.
     result: Dict[str, str] = {}
-    for tr in soup.select("tr"):
-        th = tr.find("th")
-        td = tr.find("td")
-        if not th or not td:
-            continue
-        label = clean_text(th.get_text(" ", strip=True))
-        value = normalize_value(td.get_text("\n", strip=True))
-        if label:
-            result[label] = value
     for dt in soup.select("dt"):
         dd = dt.find_next_sibling("dd")
         if not dd:
@@ -150,17 +146,12 @@ def parse_title(soup: BeautifulSoup) -> Optional[str]:
 
 
 def guess_genre_from_header(text: str) -> Optional[str]:
-    # 상단 텍스트에서 장르 힌트를 추정한다.
-    # "전체"는 오탐이 많아 기본적으로 제외한다.
-    matches: List[str] = []
-    for genre in GENRE_HINTS:
-        if genre and genre in text:
-            matches.append(genre)
-    # "전체"는 의미가 약하므로 제거
-    matches = [m for m in matches if m != "전체"]
-    # 복수 매칭이면 신뢰하기 어렵다고 보고 비움
-    if len(matches) == 1:
-        return matches[0]
+    # 비상용 폴백: header 텍스트에 GENRE_HINTS 중 첫 매칭을 반환한다.
+    # ("전체"는 의미가 약해 제외, multi-match 거부 룰은 제거.)
+    # 정확한 장르는 extract_genre_badge() 가 결정론적으로 가져온다.
+    for g in GENRE_HINTS:
+        if g and g != "전체" and g in text:
+            return g
     return None
 
 
@@ -175,6 +166,31 @@ def extract_genre_from_labels(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
+def extract_genre_badge(soup: BeautifulSoup) -> Optional[str]:
+    # KOPIS 상세 페이지는 장르를 <span class="DBDetail_cls_*"> 한 곳에 박아둔다.
+    # 이 span 텍스트가 가장 신뢰할 만한 단일 신호다.
+    el = soup.select_one('[class*="DBDetail_cls"]')
+    if el:
+        text = clean_text(el.get_text(" ", strip=True))
+        if text and text != "전체":
+            return text
+    # 2차 폴백: <h4> 의 다음 형제 <span> 텍스트가 GENRE_HINTS와 정확 일치하면 사용.
+    h4 = soup.select_one("h4")
+    if h4:
+        sib = h4.find_next_sibling("span")
+        if sib:
+            text = clean_text(sib.get_text(" ", strip=True))
+            if text in GENRE_HINTS and text != "전체":
+                return text
+    # 3차 폴백: 라벨 기반(향후 KOPIS가 라벨 구조로 회귀할 가능성 대비).
+    g = extract_genre_from_labels(soup)
+    if g:
+        return g
+    # 4차 폴백: 헤더 텍스트 키워드 스캔(비상용).
+    header_text = clean_text("\n".join(islice(soup.stripped_strings, 80)))
+    return guess_genre_from_header(header_text)
+
+
 def build_detail_url(mt20id: str) -> str:
     # mt20Id로 상세 페이지 URL을 만든다.
     query = urlencode({"menuId": "MNU_00020", "mt20Id": mt20id})
@@ -182,25 +198,34 @@ def build_detail_url(mt20id: str) -> str:
 
 
 def looks_valid_record(title: Optional[str], data: Dict[str, str]) -> bool:
-    # 공통/빈 페이지를 걸러내기 위한 최소 조건을 정의한다.
+    # title 만 있어도 유효로 인정한다(과거 silent drop 방지).
+    # title 이 비었거나 KOPIS 빈 페이지 마커면 무효.
     if not title:
         return False
     if "KOPIS | DB검색" in title:
         return False
-    # 핵심 라벨이 하나라도 있으면 유효로 간주
-    if any(k in data and data[k] for k in ("공연기간", "공연장소", "공연시간")):
-        return True
-    # 구조가 바뀌었을 수 있으므로 라벨-값이 하나라도 있으면 유효로 간주
-    if any(v for v in data.values()):
-        return True
-    return False
+    return True
+
+
+def is_sparse_record(data: Dict[str, str]) -> bool:
+    # 핵심 라벨이 하나도 없는 경우 sparse 로 분류해 skip-log 에 기록한다.
+    return not any(k in data and data[k] for k in ("공연기간", "공연장소", "공연시간"))
 
 
 def get_rendered_html(page, url: str, timeout_ms: int = 30000) -> str:
     # 브라우저로 실제 렌더링된 HTML을 가져온다.
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # noqa: F401
+
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    # 핵심 라벨이 나타날 때까지 대기(렌더링 지연 대응)
-    for sel in ("text=공연기간", "text=공연장소", "text=공연시간"):
+    # 장르 badge / 라벨 DOM이 나타날 때까지 대기(렌더링 지연 대응).
+    # 가장 결정론적 신호인 DBDetail_cls 를 우선으로 둔다.
+    for sel in (
+        '[class*="DBDetail_cls"]',
+        "dl dt",
+        "text=공연기간",
+        "text=공연장소",
+        "text=공연시간",
+    ):
         try:
             page.wait_for_selector(sel, timeout=5000)
             break
@@ -253,6 +278,29 @@ def append_ids(path: str, ids: Iterable[str]) -> None:
             f.write(mt20id + "\n")
 
 
+def log_skip(
+    path: str,
+    reason: str,
+    mt20id: str,
+    url: str,
+    snippet: str = "",
+    http_title: str = "",
+) -> None:
+    # 스킵/이상 케이스 사유를 JSONL로 누적 기록한다 (silent drop 방지).
+    if not path:
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "mt20Id": mt20id,
+        "url": url,
+        "http_title": http_title,
+        "snippet": snippet[:300] if snippet else "",
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def load_existing_ids(path: str) -> Set[str]:
     # resume 시 중복 저장을 막기 위해 기존 성공 ID를 로드한다.
     if not os.path.exists(path):
@@ -284,17 +332,90 @@ def save_checkpoint(path: str, n: int) -> None:
         f.write(str(n))
 
 
+def _probe_one(page, n: int) -> bool:
+    # 단건 valid 여부 확인 (probe_ceiling 보조 함수).
+    url = build_detail_url(f"PF{n:06d}")
+    try:
+        html = get_rendered_html(page, url)
+        soup = BeautifulSoup(html, "html.parser")
+        title = parse_title(soup)
+        data = parse_label_value_blocks(soup)
+        return looks_valid_record(title, data)
+    except Exception:
+        return False
+
+
+def probe_ceiling(
+    page,
+    start_n: int,
+    step: int = 500,
+    max_skips: int = 10,
+    max_consecutive_invalid: int = 200,
+) -> int:
+    # 1) coarse: start_n부터 step씩 점프, max_skips 연속 invalid면 종료.
+    # 2) fine: last_valid 직후부터 1씩 증가, max_consecutive_invalid 연속 invalid면 종료.
+    last_valid = start_n - 1
+    skips_in_a_row = 0
+    n = start_n
+    print(f"[PROBE] coarse phase start={start_n} step={step} max_skips={max_skips}")
+    while skips_in_a_row < max_skips:
+        if _probe_one(page, n):
+            last_valid = n
+            skips_in_a_row = 0
+            print(f"[PROBE coarse] valid PF{n:06d}")
+        else:
+            skips_in_a_row += 1
+            print(f"[PROBE coarse] invalid PF{n:06d} streak={skips_in_a_row}/{max_skips}")
+        n += step
+
+    print(f"[PROBE] fine phase from PF{max(last_valid + 1, start_n):06d}")
+    n = max(last_valid + 1, start_n)
+    invalid_streak = 0
+    while invalid_streak < max_consecutive_invalid:
+        if _probe_one(page, n):
+            last_valid = n
+            invalid_streak = 0
+            print(f"[PROBE fine] valid PF{n:06d}")
+        else:
+            invalid_streak += 1
+        n += 1
+
+    print(f"[PROBE] done last_valid=PF{last_valid:06d}")
+    return last_valid
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="PF 숫자 iterate 기반 수집기 (Playwright)")
     # 1) 실행 파라미터를 정의한다.
-    parser.add_argument("--start", type=int, required=True, help="시작 숫자 (예: 280000)")
-    parser.add_argument("--end", type=int, required=True, help="끝 숫자 포함 (예: 284000)")
-    parser.add_argument("--delay", type=float, default=0.15, help="요청 간 지연(초)")
-    parser.add_argument("--out-csv", default="kopis_iterated.csv", help="출력 CSV")
-    parser.add_argument("--out-ids", default="mt20ids_iterated.txt", help="유효 mt20Id 출력")
+    parser.add_argument("--start", type=int, default=1, help="시작 숫자 (기본 1)")
+    parser.add_argument(
+        "--end",
+        type=int,
+        default=None,
+        help="끝 숫자 포함 (예: 285240). --auto-ceiling 이면 무시.",
+    )
+    parser.add_argument(
+        "--auto-ceiling",
+        action="store_true",
+        help="probe_ceiling 으로 ceiling 자동탐지하여 --end 대신 사용. kopis_ceiling.txt에 저장.",
+    )
+    parser.add_argument(
+        "--probe-start",
+        type=int,
+        default=280000,
+        help="--auto-ceiling 시 probe 시작 PF 숫자 (기본 280000)",
+    )
+    parser.add_argument(
+        "--ceiling-file",
+        default="kopis_ceiling.txt",
+        help="auto-ceiling 결과 저장 경로",
+    )
+    parser.add_argument("--delay", type=float, default=0.3, help="요청 간 지연(초, 기본 0.3)")
+    parser.add_argument("--out-csv", default="kopis_iterated_v2.csv", help="출력 CSV")
+    parser.add_argument("--out-ids", default="mt20ids_iterated_v2.txt", help="유효 mt20Id 출력")
     parser.add_argument(
         "--checkpoint",
-        default="kopis_iterate.checkpoint",
+        default="kopis_iterate_v2.checkpoint",
         help="이어받기용 체크포인트 파일",
     )
     parser.add_argument(
@@ -325,10 +446,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="이 시도 횟수마다 진행 로그 출력(기본 50)",
     )
     parser.add_argument("--headful", action="store_true", help="브라우저 표시")
+    parser.add_argument(
+        "--skipped-log",
+        default="skipped.jsonl",
+        help="스킵/이상 케이스 사유를 누적 기록할 JSONL 파일",
+    )
 
     args = parser.parse_args(argv)
     # 2) 입력 범위를 검증한다.
-    if args.end < args.start:
+    if not args.auto_ceiling and args.end is None:
+        parser.error("--end 또는 --auto-ceiling 중 하나는 필수입니다.")
+    if args.end is not None and args.end < args.start:
         parser.error("--end는 --start 이상이어야 합니다.")
 
     # 3) resume 옵션이면 시작 지점과 기존 성공 ID를 복원한다.
@@ -349,10 +477,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     batch_ids: List[str] = []
 
     # 5) Playwright 브라우저를 열고 단일 페이지로 순회한다.
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headful)
         context = browser.new_context(locale="ko-KR")
         page = context.new_page()
+
+        # 5-1) --auto-ceiling 이면 본 루프 전에 ceiling 을 탐지한다.
+        if args.auto_ceiling:
+            ceiling = probe_ceiling(page, args.probe_start)
+            with open(args.ceiling_file, "w", encoding="utf-8") as f:
+                f.write(str(ceiling))
+            print(f"[CEILING] PF{ceiling:06d} saved to {args.ceiling_file}")
+            args.end = ceiling
 
         # 6) PF 숫자 범위를 순회하며 상세 페이지를 파싱한다.
         attempts = 0
@@ -369,12 +507,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 html = get_rendered_html(page, url)
                 soup = BeautifulSoup(html, "html.parser")
                 title = parse_title(soup)
-                # 1) 라벨 기반 장르 추론(가장 정확)
-                genre_hint = extract_genre_from_labels(soup)
-                # 2) 실패 시 상단 텍스트 기반 추론
-                if not genre_hint:
-                    header_text = clean_text("\n".join(islice(soup.stripped_strings, 80)))
-                    genre_hint = guess_genre_from_header(header_text)
+                # 1) 장르 badge span(<span class="DBDetail_cls_*">)에서 결정론적 추출.
+                #    실패 시 라벨/헤더-키워드 폴백.
+                genre_norm = extract_genre_badge(soup) or ""
+                is_musical = "True" if genre_norm == "뮤지컬" else "False"
+                # genre_hint 는 구버전 컬럼 호환을 위해 genre_norm과 동일하게 유지.
+                genre_hint = genre_norm
                 data = parse_label_value_blocks(soup)
                 # 6-3) 유효 레코드인지 검사 후, 새 성공건만 배치에 적재한다.
                 if looks_valid_record(title, data):
@@ -382,7 +520,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "mt20Id": mt20id,
                         "url": url,
                         "title": title or "",
-                        "genre_hint": genre_hint or "",
+                        "genre_hint": genre_hint,
+                        "genre_norm": genre_norm,
+                        "is_musical": is_musical,
                     }
                     row.update(data)
                     if mt20id not in seen_ids:
@@ -393,17 +533,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         print(f"[OK] {mt20id} {title}")
                     else:
                         print(f"[OK-EXIST] {mt20id} {title}")
+                    # 핵심 라벨이 비어있으면 sparse 로 별도 기록(저장은 정상 진행).
+                    if is_sparse_record(data):
+                        log_skip(
+                            args.skipped_log,
+                            "valid_sparse",
+                            mt20id,
+                            url,
+                            http_title=title or "",
+                        )
                 else:
                     # 유효하지 않으면 SKIP으로 기록한다.
                     skip_count += 1
                     print(f"[SKIP] {mt20id}")
+                    snippet = clean_text("\n".join(islice(soup.stripped_strings, 80)))
                     if args.debug_skip:
-                        snippet = clean_text("\n".join(islice(soup.stripped_strings, 80)))
                         print(f"[SKIP-DEBUG] {mt20id} snippet={snippet[:300]}")
+                    log_skip(
+                        args.skipped_log,
+                        "not_a_record",
+                        mt20id,
+                        url,
+                        snippet=snippet,
+                        http_title=title or "",
+                    )
             except Exception as e:  # noqa: BLE001
                 # 예외는 ERR로 기록하고 다음 숫자로 진행한다.
                 err_count += 1
                 print(f"[ERR] {mt20id} {e}")
+                log_skip(
+                    args.skipped_log,
+                    "render_error",
+                    mt20id,
+                    url,
+                    snippet=str(e),
+                )
             # 6-4) 서버 부하/차단 완화를 위해 지연을 둔다.
             time.sleep(max(args.delay, 0.0))
 
