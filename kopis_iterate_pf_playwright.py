@@ -214,24 +214,42 @@ def is_sparse_record(data: Dict[str, str]) -> bool:
 
 def get_rendered_html(page, url: str, timeout_ms: int = 30000) -> str:
     # 브라우저로 실제 렌더링된 HTML을 가져온다.
+    # 단순 셀렉터 도착이 아닌 본문 채워짐 여부까지 확인해야 빈 페이지 캡처를 막는다.
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # noqa: F401
 
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    # 장르 badge / 라벨 DOM이 나타날 때까지 대기(렌더링 지연 대응).
-    # 가장 결정론적 신호인 DBDetail_cls 를 우선으로 둔다.
-    for sel in (
-        '[class*="DBDetail_cls"]',
-        "dl dt",
-        "text=공연기간",
-        "text=공연장소",
-        "text=공연시간",
-    ):
-        try:
-            page.wait_for_selector(sel, timeout=5000)
-            break
-        except PlaywrightTimeoutError:
-            continue
-    page.wait_for_timeout(800)
+
+    # 1차: 장르 badge span 의 텍스트가 채워질 때까지(KOPIS 정상 페이지 신호).
+    try:
+        page.wait_for_function(
+            "() => { const el = document.querySelector('[class*=\"DBDetail_cls\"]');"
+            " return el && el.textContent.trim().length > 0; }",
+            timeout=10000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    # 2차: dl dt 가 최소 3개 이상 채워질 때까지(정상 페이지는 9개).
+    try:
+        page.wait_for_function(
+            "() => document.querySelectorAll('dl dt').length >= 3",
+            timeout=8000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    # 3차: h4 텍스트가 비어있지 않을 때까지(제목 렌더링 확인).
+    try:
+        page.wait_for_function(
+            "() => { const h = document.querySelector('h4');"
+            " return h && h.textContent.trim().length > 0; }",
+            timeout=5000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    # 마지막 짧은 폴백 시간 (네트워크 잔여 fetch 흡수).
+    page.wait_for_timeout(300)
     return page.content()
 
 
