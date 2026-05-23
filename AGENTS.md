@@ -7,7 +7,7 @@ This repo collects KOPIS musical-category performance data via:
 ## Priorities
 - Preserve resumability and checkpoint-based collection (works for both range and ids-file modes).
 - Avoid breaking the deterministic genre detection in `extract_genre_badge` (reads `<span class*="DBDetail_cls">`).
-- Keep `mt20ids_musical.txt` as the canonical input list; regenerate via `enumerate_musicals.py` when KOPIS site updates.
+- `mt20ids_musical.txt` is the canonical input; regenerate via `enumerate_musicals.py` when KOPIS site updates.
 - Before execution, summarize: problem definition -> cause -> solution.
 
 ## Commit Rules
@@ -16,20 +16,17 @@ This repo collects KOPIS musical-category performance data via:
 
 ## Files
 
-### Code
+### Code (committed)
 - `enumerate_musicals.py` — JSON API list collector
 - `kopis_iterate_pf_playwright.py` — Playwright detail scraper (range / auto-ceiling / ids-file modes)
 - `verify_rescrape.py` — old/new CSV diff report
 
-### Data inputs
+### Data (committed)
 - `mt20ids_musical.txt` — enumerated musical mt20Ids
+- `kopis_musical.csv` — collected musical performance records (21,764 rows)
 
-### Generated outputs (gitignored)
-- `kopis_musical.csv` — main result
-- `mt20ids_musical_done.txt` — completed mt20Ids
-- `kopis_iterate_musical.checkpoint` — last processed mt20Id
-- `skipped_musical.jsonl` — skip/anomaly log
-- `run_musical.log`, `run_musical.pid` — background-run artifacts
+### Runtime artifacts (gitignored, regenerable)
+- `*.checkpoint`, `*.log`, `*.pid`, `skipped*.jsonl`, `run_musical.*`
 
 ### Branch
 - `legacy/v1-scraper` — frozen archive of v1 brute-force PF iterator and its 142k CSV.

@@ -1,13 +1,12 @@
 # data outputs
 *.tmp
 
-# v2 musical run artifacts (regenerable, large)
-kopis_musical.csv
-mt20ids_musical_done.txt
-kopis_iterate_musical.checkpoint
-skipped_musical.jsonl
-run_musical.log
-run_musical.pid
+# runtime artifacts (regenerable, do not commit)
+*.checkpoint
+*.log
+*.pid
+skipped*.jsonl
+run_musical.*
 
 # playwright
 playwright-report/
@@ -17,9 +16,6 @@ playwright-report/
 __pycache__/
 *.pyc
 .venv/
-
-# logs
-*.log
 
 # claude
 .claude/

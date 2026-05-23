@@ -5,6 +5,7 @@
 - Approach: two-stage pipeline
   1. List enumeration via KOPIS internal JSON API (`enumerate_musicals.py`)
   2. Detail page rendering and parsing via Playwright (`kopis_iterate_pf_playwright.py --ids-file`)
-- Main inputs: `mt20ids_musical.txt`
-- Main outputs (gitignored): `kopis_musical.csv`, `mt20ids_musical_done.txt`, checkpoint, `skipped_musical.jsonl`
-- Data collection jobs are resumable; v1 brute-force iterator is archived in `legacy/v1-scraper`.
+- Inputs (committed): `mt20ids_musical.txt`
+- Outputs (committed): `kopis_musical.csv` (21,764 rows as of 2026-05-23)
+- Runtime artifacts (gitignored, regenerable): checkpoint, run log, PID, skipped jsonl
+- Resumable; v1 brute-force iterator is archived in `legacy/v1-scraper`.
